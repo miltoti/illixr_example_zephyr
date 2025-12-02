@@ -13,6 +13,7 @@ public:
 
     void initialize(const char* data_path, const char* demo_data_path);
     void start_all_plugins();
+    void run_all_plugins();
     void shutdown();
 
 private:

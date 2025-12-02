@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(illixr_static)
+project(illixr_working)
 
 # ============================================================
 # === YAML CONFIG PARSING ====================================
@@ -36,6 +36,7 @@ target_include_directories(app PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_sources(app PRIVATE
     src/main.cpp
     src/runtime.cpp
+    src/relative_clock.cpp
     src/phonebook_new.cpp
 )
 
@@ -66,29 +67,19 @@ if(PLUGIN_LINE)
 
     message(STATUS "Resolved plugins: ${PLUGIN_NAMES_CLEAN}")
 
-    # ============================================================
-    # === ADD ALL CPP FILES IN EACH PLUGIN DIRECTORY ============
-    # ============================================================
-
     foreach(P IN LISTS PLUGIN_NAMES_CLEAN)
         set(PLUGIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/plugins/${P}")
 
-        if(NOT EXISTS "${PLUGIN_DIR}")
-            message(WARNING "Plugin directory '${PLUGIN_DIR}' does not exist — skipping.")
-            continue()
+        message(STATUS "Adding plugin '${P}' from ${PLUGIN_DIR}")
+
+        add_subdirectory("${PLUGIN_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/plugins/${P}")
+
+        if(TARGET ${P})
+            # P is an OBJECT library: pull its .o files directly into app
+            target_sources(app PRIVATE $<TARGET_OBJECTS:${P}>)
+            message(STATUS "Added plugin '${P}' object files into app")
+        else()
+            message(WARNING "Plugin '${P}' did not define target '${P}'")
         endif()
-
-        # Glob .cpp files in this plugin folder
-        file(GLOB PLUGIN_CPP_FILES "${PLUGIN_DIR}/*.cpp")
-
-        if(NOT PLUGIN_CPP_FILES)
-            message(WARNING "Plugin '${P}' has no .cpp files — skipping.")
-            continue()
-        endif()
-
-        message(STATUS "Adding plugin '${P}' sources: ${PLUGIN_CPP_FILES}")
-
-        # Add all plugin source files directly to app target
-        target_sources(app PRIVATE ${PLUGIN_CPP_FILES})
     endforeach()
 endif()

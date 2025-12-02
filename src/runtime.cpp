@@ -3,6 +3,7 @@
 #include "phonebook_new.hpp"
 #include <zephyr/kernel.h>
 #include <stdio.h>
+#include "relative_clock.hpp"
 
 namespace ILLIXR {
 
@@ -87,6 +88,18 @@ void Runtime::start_all_plugins() {
     }
 
     printf("[runtime] All plugins launched.\n");
+
+    auto& rc = get_global_relative_clock();
+    rc.start();
+    rc.print();
+
+    printf("[runtime] Global RelativeClock started\n");
+}
+
+void Runtime::run_all_plugins() {
+    printf("[runtime] run_all_plugins() called\n");
+    // In this static runtime, all plugins are already started in their own threads.
+    // This function can be used for additional runtime management if needed.
 }
 
 void Runtime::shutdown() {

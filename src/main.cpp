@@ -25,6 +25,8 @@ int main() {
     // 5. Start all plugins
     runtime.start_all_plugins();
 
+    runtime.run_all_plugins();
+
     // 6. Sleep for run duration
     k_sleep(K_SECONDS(50));
 

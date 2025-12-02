@@ -1,6 +1,6 @@
 # Minimal ILLIXR YAML for testing static build
-plugins: plugin1, plugin2, p3
-data: ../data/V1_02_medium/mav0
+plugins: p3, offline_imu
+data: data/V1_02_medium/mav0
 demo_data: ../demo_data
 duration: 5
 build_type: Debug
