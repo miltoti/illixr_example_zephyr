@@ -1,16 +1,8 @@
+// node.cpp
+
 #include "node.hpp"
 
 namespace ILLIXR {
-
-// ---------------------------
-// Node Constructor Behavior
-// ---------------------------
-// - Node() and Node(name) DO NOT register with phonebook.
-// - Only initialize() registers the plugin.
-// - This avoids global static constructor usage before Zephyr boot.
-
-// Default constructor already covered in header.
-// Name-only constructor already covered in header.
 
 // ---------------------------
 // Explicit initialization
@@ -23,20 +15,33 @@ void Node::initialize(phonebook_new& pb, const char* name) {
     strncpy(name_, name, MAX_PLUGIN_NAME_LEN - 1);
     name_[MAX_PLUGIN_NAME_LEN - 1] = '\0';
 
-    // Register with phonebook now that RTOS is running
-    pb_->register_plugin(name_, this);
+    // NOTE: registration with phonebook is done elsewhere (Plugin wrapper).
 }
-
 
 void Node::shutdown() {
-    running_ = false;
-
-    // optionally wake threads, drain queues, etc
+    // Stub for now. You could:
+    // - Clear periodic_jobs_
+    // - Notify other components
+    // For now we'll just leave it empty.
+    // periodic_jobs_.clear();
 }
 
 // ---------------------------
-// Virtual start()
+// Periodic service
 // ---------------------------
-// No implementation needed; plugins override start().
+
+void Node::service_periodic() {
+    if (!pb_) { return; }
+
+    uint64_t now_ms = k_uptime_get();
+    for (auto& job : periodic_jobs_) {
+        job->tick(now_ms);
+    }
+}
+
+// ---------------------------
+// start() is virtual and has
+// no base implementation.
+// ---------------------------
 
 } // namespace ILLIXR

@@ -1,85 +1,88 @@
-// plugins/p3/plugin.cpp
-
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
-
-#include "../../src/node.hpp"
-#include "../../src/phonebook_new.hpp"
+#include "../../src/plugin.hpp"
 #include "../../src/plugin_registry.hpp"
-#include "../../src/data_format.hpp" // For ImuMsg definition
+#include "../../src/data_format.hpp"
 
 using namespace ILLIXR;
 
-// -------------------------
-// P3 (contains Node)
-// -------------------------
-class P3 {
+#define P3_STACK_SIZE 1024
+#define P3_PRIORITY   7
+
+static K_THREAD_STACK_DEFINE(p3_stack_area, P3_STACK_SIZE);
+K_MSGQ_DEFINE(p3_queue, sizeof(ImuMsg), 10, 4);
+
+class P3Plugin : public Plugin {
 public:
-    P3(phonebook_new& pb)
-        : node_{}
-    {
-        printk("[p3] Constructor\n");
-        node_.initialize(pb, "p3");
-    }
-
-    void configure() {
-        printk("[p3] configuring subscriptions\n");
-
-        // Subscribing to ImuMsg from "offline_imu"
+    P3Plugin(phonebook_new& pb) : Plugin(pb, "p3") {
+        // We only subscribe to IMU data now.
+        // We handle it Asynchronously via the Queue.
         node_.subscribe_from<ImuMsg>(
-            "offline_imu", 
-            &P3::on_imu_data, 
+            "offline_imu",
+            [](void* ctx, const ImuMsg& msg) {
+                // Runs on SENDER Thread (IMU Thread)
+                // Action: Quick hand-off to the mailbox.
+                k_msgq_put(&p3_queue, &msg, K_NO_WAIT);
+            },
             this
         );
     }
 
-    void start() {
-        printk("[p3] start() thread running (Waiting for IMU data)\n");
-        // We still keep the thread alive while callbacks handle the data.
-        while (true) {
-            k_sleep(K_SECONDS(1)); 
-        }
+    void start() override {
+        k_thread_create(
+            &thread_data_,
+            p3_stack_area,
+            K_THREAD_STACK_SIZEOF(p3_stack_area),
+            thread_entry_point,
+            this, NULL, NULL,
+            K_PRIO_PREEMPT(P3_PRIORITY),
+            0,
+            K_NO_WAIT
+        );
     }
 
 private:
-    Node node_;
+    struct k_thread thread_data_;
 
-    // NEW CALLBACK: Handles incoming ImuMsg messages and prints data
-    static void on_imu_data(void* ctx, const ImuMsg& msg) {
-        // We don't need 'self' (ctx) for simple printing, but we keep the signature.
-        (void)ctx; 
-        
-        // Access the time duration from the time_point
-        long long time_ns = msg.time.time_since_epoch().count();
+    static void thread_entry_point(void* p1, void*, void*) {
+        static_cast<P3Plugin*>(p1)->run_loop();
+    }
 
-        printk("--- [p3] IMU DATA RECEIVED --- \n");
-        printk("[p3] T_Relative: %lld ns\n", time_ns);
+    void run_loop() {
+        // Print identity ONCE
+        printk("========================================\n");
+        printk("[p3] WORKER STARTED. Thread ID: %p\n", k_current_get());
+        printk("========================================\n");
         
-        // Print the Angular Velocity
-        printk("[p3] Ang. Vel (rad/s): X: %f, Y: %f, Z: %f\n",
-               msg.angular_v.x(), 
-               msg.angular_v.y(), 
-               msg.angular_v.z());
-        
-        // Print the Linear Acceleration
-        printk("[p3] Lin. Acc (m/s^2): X: %f, Y: %f, Z: %f\n",
-               msg.linear_a.x(), 
-               msg.linear_a.y(), 
-               msg.linear_a.z());
-        printk("----------------------------------- \n");
+        ImuMsg local_msg;
+
+        while (!should_stop_) {
+            node_.service_periodic();
+
+            // Wait for data (blocks here until IMU sends something)
+            if (k_msgq_get(&p3_queue, &local_msg, K_MSEC(20)) == 0) {
+                process_data(local_msg);
+            }
+        }
+    }
+
+    void process_data(const ImuMsg& msg) {
+        // Runs on RECEIVER Thread (P3 Thread)
+        printk("[p3] Processing time: %lld | Thread: %p\n", 
+               (long long)msg.time.time_since_epoch().count(),
+               k_current_get());
+        // Print data
+        // EIgen format
+        printk("[p3]   Angular Vel: [%f, %f, %f]\n",
+               msg.angular_v[0], msg.angular_v[1], msg.angular_v[2]);
+        printk("[p3]   Linear Acc: [%f, %f, %f]\n",
+               msg.linear_a[0], msg.linear_a[1], msg.linear_a[2]);
     }
 };
 
-// -------------------------
-// Factory
-// -------------------------
 void start_p3(phonebook_new& pb) {
-    printk("[p3] start_p3() called\n");
-    // IN the future, ready signal bit should be used to start the plugin
-    static P3 instance{pb};
-    instance.configure();
-    // Note: Runtime will call instance.start() later if it uses the two-loop pattern.
-    // If you need p3 to start immediately (like offline_imu), call instance.start() here.
+    static P3Plugin instance{pb};
+    instance.start();
 }
 
 REGISTER_PLUGIN(p3);

@@ -35,7 +35,8 @@ target_include_directories(app PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 target_sources(app PRIVATE
     src/main.cpp
-    src/runtime.cpp
+    src/node.cpp
+    #src/runtime.cpp
     src/relative_clock.cpp
     src/phonebook_new.cpp
 )

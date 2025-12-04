@@ -2,9 +2,13 @@
 #define ILLIXR_NODE_HPP
 
 #include "phonebook_new.hpp"
+
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <vector>
+#include <memory>
+#include <zephyr/kernel.h> // for k_uptime_get
 
 namespace ILLIXR {
 
@@ -14,47 +18,27 @@ constexpr size_t MAX_PLUGIN_NAME_LEN = 32;
  * RTOS-safe Node
  *
  * IMPORTANT:
- *   - Constructor does NOT touch the phonebook.
- *   - Node is registered ONLY after Zephyr kernel boot,
- *     via an explicit call to initialize().
- *
- * This prevents global static constructors from crashing Zephyr.
+ * - Registration is handled by the Plugin wrapper.
+ * - Periodic publishing does NOT create extra threads.
+ * Plugins must call Node::service_periodic() from their own thread loop.
  */
 class Node {
 public:
     typedef void (*MsgCallbackFn)(void* context, const void* msg);
 
-    /** Constructor: does NOT register with phonebook yet */
-    Node()
-        : pb_(nullptr) {
+    Node() : pb_{nullptr} {
         name_[0] = '\0';
     }
 
-    /** Constructor with name only (still does NOT register) */
-    explicit Node(const char* name)
-        : pb_(nullptr) {
+    explicit Node(const char* name) : pb_{nullptr} {
         strncpy(name_, name, MAX_PLUGIN_NAME_LEN - 1);
         name_[MAX_PLUGIN_NAME_LEN - 1] = '\0';
-    }
-
-    /** Explicit initialization; must be called after Zephyr boot */
-    void initialize(phonebook_new& pb, const char* name) {
-        pb_ = &pb;
-
-        strncpy(name_, name, MAX_PLUGIN_NAME_LEN - 1);
-        name_[MAX_PLUGIN_NAME_LEN - 1] = '\0';
-
-        // Safe: phonebook now exists, Zephyr kernel is alive
-        pb_->register_plugin(name_, this);
     }
 
     virtual ~Node() = default;
 
-    /**
-     * Called inside thread context after all plugins are registered.
-     * Plugins override this to start their logic.
-     */
-    virtual void start() {}
+    void initialize(phonebook_new& pb, const char* name);
+    void shutdown();
 
     // -----------------------------
     // Messaging utilities
@@ -73,19 +57,80 @@ public:
         pb_->publish<MsgT>(name_, receiver_name, msg);
     }
 
+    /**
+     * Registers a periodic job.
+     * DOES NOT create a thread. The plugin's thread must call service_periodic().
+     */
     template<typename MsgT, typename MsgGenerator>
     void publish_to_periodic(const char* receiver_name,
                              uint32_t interval_ms,
                              MsgGenerator generator) {
         if (!pb_) { return; }
-        pb_->publish_periodic<MsgT>(name_, receiver_name, interval_ms, generator);
+
+        using JobT = PeriodicJob<MsgT, MsgGenerator>;
+        auto job   = std::make_unique<JobT>(
+            pb_,
+            name_,
+            receiver_name,
+            interval_ms,
+            generator
+        );
+        periodic_jobs_.push_back(std::move(job));
     }
+
+    /**
+     * Drives the periodic jobs. Call this in your plugin's while(1) loop.
+     */
+    void service_periodic();
 
     const char* name() const { return name_; }
 
 private:
-    phonebook_new* pb_;                 // safe: only set after init
+    // Base class for polymorphic storage of templated jobs
+    struct PeriodicJobBase {
+        virtual ~PeriodicJobBase() = default;
+        virtual void tick(uint64_t now_ms) = 0;
+    };
+
+    template<typename MsgT, typename Generator>
+    struct PeriodicJob : PeriodicJobBase {
+        phonebook_new* pb;
+        char           sender[MAX_PLUGIN_NAME_LEN];
+        char           receiver[MAX_PLUGIN_NAME_LEN];
+        Generator      gen;
+        uint32_t       interval_ms;
+        uint64_t       next_fire_ms;
+
+        PeriodicJob(phonebook_new* pb_,
+                    const char* sender_name,
+                    const char* receiver_name,
+                    uint32_t interval,
+                    Generator g)
+            : pb{pb_}
+            , gen{g}
+            , interval_ms{interval}
+            , next_fire_ms{k_uptime_get() + interval}
+        {
+            strncpy(sender,   sender_name,   MAX_PLUGIN_NAME_LEN - 1);
+            sender[MAX_PLUGIN_NAME_LEN - 1] = '\0';
+
+            strncpy(receiver, receiver_name, MAX_PLUGIN_NAME_LEN - 1);
+            receiver[MAX_PLUGIN_NAME_LEN - 1] = '\0';
+        }
+
+        void tick(uint64_t now_ms) override {
+            if (!pb) { return; }
+            if (now_ms >= next_fire_ms) {
+                MsgT msg = gen();
+                pb->template publish<MsgT>(sender, receiver, msg);
+                next_fire_ms = now_ms + interval_ms;
+            }
+        }
+    };
+
+    phonebook_new* pb_;
     char           name_[MAX_PLUGIN_NAME_LEN];
+    std::vector<std::unique_ptr<PeriodicJobBase>> periodic_jobs_;
 };
 
 } // namespace ILLIXR

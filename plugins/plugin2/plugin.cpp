@@ -1,4 +1,6 @@
 // plugins/plugin2/plugin.cpp
+
+#include <stdint.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 
@@ -7,15 +9,20 @@
 
 using namespace ILLIXR;
 
+// ---------- static Zephyr thread objects for this plugin ----------
+static K_THREAD_STACK_DEFINE(plugin2_stack, 4096);
+static struct k_thread       plugin2_thread;
+
 constexpr size_t MAX_TIMESTAMPS = 16;
 
+// Same as in plugin1
 struct SensorMsg {
-    int timestamp;
+    int64_t t_ns;
 };
 
 struct SummaryMsg {
-    int timestamps[MAX_TIMESTAMPS];
-    size_t count;
+    int64_t timestamps[MAX_TIMESTAMPS];
+    size_t  count;
 };
 
 class Plugin2 : public Plugin {
@@ -24,11 +31,12 @@ public:
         : Plugin{pb, "plugin2"}
         , received_count_{0}
     {
-        printk("[plugin2] Constructor\n");
+        printk("[plugin2] ctor\n");
+        configure();
     }
 
     void configure() {
-        printk("[plugin2] configuring subscriptions\n");
+        printk("[plugin2] configuring subscription from plugin1\n");
 
         node().subscribe_from<SensorMsg>(
             "plugin1",
@@ -37,25 +45,55 @@ public:
         );
     }
 
-    void start() {
-        printk("[plugin2] start() entered\n");
+    // --------- plugin worker loop (runs in plugin2 thread) ---------
+    void thread_loop() {
+        printk("[plugin2] thread_loop start\n");
+
         while (true) {
-            printk("[plugin2] alive\n");
-            k_sleep(K_SECONDS(1));
+            // If plugin2 ever uses publish_to_periodic, this will drive it.
+            node().service_periodic();
+
+            // any other background work for plugin2 can go here
+
+            k_msleep(10);
         }
     }
 
-private:
-    int    received_[MAX_TIMESTAMPS];
-    size_t received_count_;
+    static void thread_entry(void* p1, void*, void*) {
+        auto* self = static_cast<Plugin2*>(p1);
+        self->thread_loop();
+    }
 
+    void start() override {
+        printk("[plugin2] Spawning thread...\n");
+
+        k_tid_t tid = k_thread_create(
+            &plugin2_thread,
+            plugin2_stack,
+            K_THREAD_STACK_SIZEOF(plugin2_stack),
+            &Plugin2::thread_entry,
+            this, nullptr, nullptr,
+            5,  // priority
+            0,
+            K_NO_WAIT
+        );
+
+        k_thread_name_set(tid, "plugin2");
+        printk("[plugin2] Thread spawned, tid=%p\n", (void*)tid);
+    }
+
+private:
+    int64_t received_[MAX_TIMESTAMPS];
+    size_t  received_count_;
+
+    // Subscription callback (runs in publisher’s thread, i.e. plugin1’s)
     static void on_sensor(void* ctx, const SensorMsg& msg) {
         auto* self = static_cast<Plugin2*>(ctx);
 
-        printk("[plugin2] received timestamp=%d\n", msg.timestamp);
+        printk("[plugin2] received t_ns=%lld\n", (long long)msg.t_ns);
 
         if (self->received_count_ < MAX_TIMESTAMPS) {
-            self->received_[self->received_count_++] = msg.timestamp;
+            self->received_[self->received_count_++] = msg.t_ns;
         }
 
         if (self->received_count_ == 6) {
@@ -65,7 +103,7 @@ private:
             SummaryMsg summary{};
             summary.count = self->received_count_;
 
-            for (size_t i = 0; i < summary.count; i++) {
+            for (size_t i = 0; i < summary.count; ++i) {
                 summary.timestamps[i] = self->received_[i];
             }
 
@@ -77,10 +115,5 @@ private:
     }
 };
 
-void start_plugin2(phonebook_new& pb) {
-    printk("[plugin2] start_plugin2() called\n");
-    static Plugin2 instance{pb};
-    instance.configure();      // NO instance.start()
-}
-
-REGISTER_PLUGIN(plugin2);
+// ---------- glue into registry ----------
+REGISTER_PLUGIN(Plugin2, plugin2);

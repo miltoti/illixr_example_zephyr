@@ -3,77 +3,95 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 
-#include "../../src/node.hpp"
-#include "../../src/phonebook_new.hpp"
+#include "../../src/plugin.hpp"
 #include "../../src/plugin_registry.hpp"
 #include "../../src/relative_clock.hpp"
 
 using namespace ILLIXR;
 
-// ---------------------------------------------------------
-// Message type
-// ---------------------------------------------------------
+// ---------- static Zephyr thread objects for this plugin ----------
+static K_THREAD_STACK_DEFINE(plugin1_stack, 4096);
+static struct k_thread       plugin1_thread;
+
+// ---------- message type ----------
 struct SensorMsg {
-    std::int64_t t_ns;  // timestamp in nanoseconds (relative to global RelativeClock start)
+    std::int64_t t_ns;  // timestamp in nanoseconds
 };
 
-// ---------------------------------------------------------
-// Plugin1 (contains Node)
-// ---------------------------------------------------------
-class Plugin1 {
+class Plugin1 : public Plugin {
 public:
     explicit Plugin1(phonebook_new& pb)
-        : node_{}
+        : Plugin{pb, "plugin1"}
         , clock_{get_global_relative_clock()}
         , counter_{0}
     {
-        printk("[plugin1] Constructor\n");
-        node_.initialize(pb, "plugin1");
+        printk("[plugin1] ctor\n");
+        configure();
     }
 
     void configure() {
-        printk("[plugin1] configuring: setting up periodic publisher\n");
+        printk("[plugin1] configuring periodic publisher\n");
 
-        // Publish a SensorMsg every 500 ms to "plugin2"
-        node_.publish_to_periodic<SensorMsg>(
+        // Register a periodic job on our Node.
+        // No extra thread here; Node just stores the job.
+        node().publish_to_periodic<SensorMsg>(
             "plugin2",
-            500,   // period in ms
+            500,   // every 500 ms
             [this]() -> SensorMsg {
-                // Use global RelativeClock for timestamp
                 std::int64_t t_ns = clock_.now_ns();
 
                 printk("[plugin1] sending sample #%d at t=%lld ns\n",
                        counter_, (long long)t_ns);
 
                 ++counter_;
-                return SensorMsg{ t_ns };
+                return SensorMsg{t_ns};
             }
         );
     }
 
-    // Optional: not used by runtime (runtime threads over Node and calls Node::start())
-    void start() {
-        printk("[plugin1] start() entered\n");
+    // --------- plugin worker loop (runs in plugin1 thread) ---------
+    void thread_loop() {
+        printk("[plugin1] thread_loop start\n");
+
         while (true) {
-            printk("[plugin1] alive\n");
-            k_sleep(K_SECONDS(1));
+            // Drive all periodic jobs registered via publish_to_periodic()
+            node().service_periodic();
+
+            // Do any other plugin1 work here...
+
+            k_msleep(10);  // don’t busy spin
         }
     }
 
+    // Static Zephyr entry trampoline
+    static void thread_entry(void* p1, void*, void*) {
+        auto* self = static_cast<Plugin1*>(p1);
+        self->thread_loop();
+    }
+
+    // --------- required by Plugin base: spawn thread, return immediately ---------
+    void start() override {
+        printk("[plugin1] Spawning thread...\n");
+
+        k_tid_t tid = k_thread_create(
+            &plugin1_thread,
+            plugin1_stack,
+            K_THREAD_STACK_SIZEOF(plugin1_stack),
+            &Plugin1::thread_entry,
+            this, nullptr, nullptr,
+            5,  // priority
+            0,
+            K_NO_WAIT
+        );
+
+        k_thread_name_set(tid, "plugin1");
+        printk("[plugin1] Thread spawned, tid=%p\n", (void*)tid);
+    }
+
 private:
-    Node           node_;   // Node used for pub/sub + registration in phonebook
-    RelativeClock& clock_;  // Reference to global RelativeClock
+    RelativeClock& clock_;
     int            counter_;
 };
 
-// ---------------------------------------------------------
-// Factory
-// ---------------------------------------------------------
-void start_plugin1(phonebook_new& pb) {
-    printk("[plugin1] start_plugin1() called\n");
-    static Plugin1 instance{pb};
-    instance.configure();   // DO NOT call instance.start(); runtime owns threads via Node
-}
-
-// Keep existing registry macro as-is
-REGISTER_PLUGIN(plugin1);
+// ---------- glue into registry ----------
+REGISTER_PLUGIN(Plugin1, plugin1);

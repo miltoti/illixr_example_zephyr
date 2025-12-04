@@ -18,7 +18,7 @@ class phonebook_new {
 public:
     struct Entry {
         const char* name;
-        Node*       instance;
+        Node* instance;
     };
 
     phonebook_new() : count_(0), channel_count_(0) {
@@ -26,6 +26,7 @@ public:
     }
 
     bool register_plugin(const char* name, Node* instance) {
+        // ... (Keep existing implementation) ...
         printf("Registering plugin: %s\n", name);
         k_mutex_lock(&mutex_, K_FOREVER);
         if (count_ >= MAX_PLUGINS) {
@@ -38,6 +39,7 @@ public:
     }
 
     Node* lookup(const char* name) {
+        // ... (Keep existing implementation) ...
         k_mutex_lock(&mutex_, K_FOREVER);
         for (size_t i = 0; i < count_; i++) {
             if (strcmp(name, entries_[i].name) == 0) {
@@ -50,6 +52,7 @@ public:
         return nullptr;
     }
 
+    // ... (Keep iterators begin/end/size) ...
     Entry* begin()       { return entries_; }
     Entry* end()         { return entries_ + count_; }
     const Entry* begin() const { return entries_; }
@@ -85,6 +88,7 @@ public:
                    void (*cb)(void*, const MsgT&),
                    void* ctx)
     {
+        // ... (Keep existing implementation) ...
         k_mutex_lock(&mutex_, K_FOREVER);
         Channel* ch = find_or_create_channel(sender, receiver);
         if (!ch || ch->sub_count >= MAX_SUBSCRIBERS_PER_CHANNEL) {
@@ -104,6 +108,7 @@ public:
                  const char* receiver,
                  const MsgT& msg)
     {
+        // ... (Keep existing implementation) ...
         k_mutex_lock(&mutex_, K_FOREVER);
         Channel* ch = find_channel(sender, receiver);
         if (ch) {
@@ -118,48 +123,10 @@ public:
     }
 
     // ================================================================
-    // PERIODIC PUBLISHING
+    // PERIODIC PUBLISHING (REMOVED)
     // ================================================================
-    template<typename MsgT, typename Generator>
-    void publish_periodic(const char* sender,
-                          const char* receiver,
-                          uint32_t interval_ms,
-                          Generator gen)
-    {
-        struct Args {
-            phonebook_new* self;
-            const char* sender;
-            const char* receiver;
-            Generator gen;
-            uint32_t interval;
-        };
-
-        Args* args = new Args{this, sender, receiver, gen, interval_ms};
-
-        auto thread_fn = [](void* a, void*, void*) {
-            Args* arg = static_cast<Args*>(a);
-            while (1) {
-                MsgT msg = arg->gen();
-                arg->self->template publish<MsgT>(arg->sender, arg->receiver, msg);
-                k_msleep(arg->interval);
-            }
-        };
-
-        // Each plugin can have multiple periodic publishers
-        static K_THREAD_STACK_DEFINE(p_stack, 1024);
-        static struct k_thread p_thread;
-
-        k_thread_create(
-            &p_thread,
-            p_stack,
-            K_THREAD_STACK_SIZEOF(p_stack),
-            thread_fn,
-            args, nullptr, nullptr,
-            K_PRIO_PREEMPT(5),
-            0,
-            K_NO_WAIT
-        );
-    }
+    // The publish_periodic thread creation logic is deleted.
+    // Plugins must now drive their own threads using Node::service_periodic().
 
 private:
     k_mutex mutex_;

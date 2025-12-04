@@ -11,5 +11,4 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE zephyr_interface)
 target_include_directories(${PLUGIN_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src
     ${ZEPHYR_BASE}/../modules/lib/eigen
-
 )
