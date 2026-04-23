@@ -1,6 +1,5 @@
 #include "relative_clock.hpp"
-
-#include <cstdio>  // std::printf
+#include <cstdio>
 
 namespace ILLIXR {
 

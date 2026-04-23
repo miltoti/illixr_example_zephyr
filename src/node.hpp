@@ -38,7 +38,6 @@ public:
     virtual ~Node() = default;
 
     void initialize(phonebook_new& pb, const char* name);
-    void shutdown();
 
     // -----------------------------
     // Messaging utilities
@@ -84,7 +83,18 @@ public:
     void service_periodic();
 
     const char* name() const { return name_; }
+    using ShutdownCallback = void (*)(void*);
 
+        void set_shutdown_callback(ShutdownCallback cb, void* ctx) {
+            shutdown_cb_  = cb;
+            shutdown_ctx_ = ctx;
+        }
+
+        void shutdown() {
+            if (shutdown_cb_) {
+                shutdown_cb_(shutdown_ctx_);
+            }
+        }
 private:
     // Base class for polymorphic storage of templated jobs
     struct PeriodicJobBase {
@@ -131,7 +141,8 @@ private:
     phonebook_new* pb_;
     char           name_[MAX_PLUGIN_NAME_LEN];
     std::vector<std::unique_ptr<PeriodicJobBase>> periodic_jobs_;
-};
+    ShutdownCallback shutdown_cb_;
+    void* shutdown_ctx_;};
 
 } // namespace ILLIXR
 

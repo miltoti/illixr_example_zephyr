@@ -1,6 +1,6 @@
 #include "phonebook_new.hpp"
 #include <new>
-
+#include <cstdio>
 namespace ILLIXR {
 
 // Allocate raw storage for the phonebook instance

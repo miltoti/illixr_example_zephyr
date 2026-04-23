@@ -18,14 +18,6 @@ void Node::initialize(phonebook_new& pb, const char* name) {
     // NOTE: registration with phonebook is done elsewhere (Plugin wrapper).
 }
 
-void Node::shutdown() {
-    // Stub for now. You could:
-    // - Clear periodic_jobs_
-    // - Notify other components
-    // For now we'll just leave it empty.
-    // periodic_jobs_.clear();
-}
-
 // ---------------------------
 // Periodic service
 // ---------------------------
