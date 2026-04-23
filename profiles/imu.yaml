@@ -1,5 +1,5 @@
 # Minimal ILLIXR YAML for testing static build
-plugins: offline_imu, p3
+plugins: offline_imu, offline_cam, openvins, imu_integrator
 data: data/V1_02_medium/mav0
 demo_data: ../demo_data
 duration: 5
