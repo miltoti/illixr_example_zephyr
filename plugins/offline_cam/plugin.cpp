@@ -1,96 +1,96 @@
-#include "data_loading.hpp"
-#include "illixr/opencv_data_types.hpp"
-#include "illixr/phonebook.hpp"
-#include "illixr/relative_clock.hpp"
-#include "illixr/threadloop.hpp"
-
+#include <zephyr/kernel.h>
+#include <cstdint>
 #include <chrono>
-#include <shared_mutex>
-#include <thread>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+
+#include "../../src/data_format_opencv.hpp"
+#include "../../src/helper/opencv_helper.hpp"
+#include "../../src/threadloop.hpp"
+#include "../../src/phonebook_new.hpp"
+#include "../../src/plugin_registry.hpp"
+#include "../../src/stoplight.hpp"
+#include "../openvins/openvins_queues.hpp"
+
+#include "embedded_cam.hpp"
 
 using namespace ILLIXR;
 
-class offline_cam : public threadloop {
+K_THREAD_STACK_DEFINE(offline_cam_stack, 524288);
+
+class Offline_cam : public threadloop {
 public:
-    offline_cam(const std::string& name_, phonebook* pb_)
-        : threadloop{name_, pb_}
-        , sb{pb->lookup_impl<switchboard>()}
-        , _m_cam_publisher{sb->get_writer<cam_type>("cam")}
-        , _m_sensor_data{load_data()}
-        , dataset_first_time{_m_sensor_data.cbegin()->first}
-        , last_ts{0}
-        , _m_rtc{pb->lookup_impl<RelativeClock>()}
-        , next_row{_m_sensor_data.cbegin()} {
-        spdlogger(std::getenv("OFFLINE_CAM_LOG_LEVEL"));
+    explicit Offline_cam(phonebook_new& pb)
+        : threadloop{pb, "offline_cam",
+                     offline_cam_stack,
+                     K_THREAD_STACK_SIZEOF(offline_cam_stack),
+                     5}
+        , current_idx_{0}
+    {
+        printf("[offline_cam] constructed  frames=%zu (EuRoC embedded)\n",
+               kEmbeddedCamCount);
+    }
+
+    void _p_thread_setup() override {
+        printf("[offline_cam] _p_thread_setup() tid=%p\n", k_current_get());
     }
 
     skip_option _p_should_skip() override {
-        if (true) {
-            return skip_option::run;
-        } else {
+        if (current_idx_ >= kEmbeddedCamCount)
             return skip_option::stop;
-        }
+        return skip_option::run;
     }
 
     void _p_one_iteration() override {
-        duration time_since_start = _m_rtc->now().time_since_epoch();
-        // duration begin            = time_since_start;
-        ullong lookup_time = std::chrono::nanoseconds{time_since_start}.count() + dataset_first_time;
-        std::map<ullong, sensor_types>::const_iterator nearest_row;
+        k_sem_take(&stoplight_cam, K_FOREVER);
 
-        // "std::map::upper_bound" returns an iterator to the first pair whose key is GREATER than the argument.
-        auto after_nearest_row = _m_sensor_data.upper_bound(lookup_time);
+        const auto& frame = kEmbeddedCam[current_idx_];
 
-        if (after_nearest_row == _m_sensor_data.cend()) {
-#ifndef NDEBUG
-            spdlog::get(name)->warn("Running out of the dataset! Time {} ({} + {}) after last datum {}", lookup_time,
-                                    _m_rtc->now().time_since_epoch().count(), dataset_first_time,
-                                    _m_sensor_data.rbegin()->first);
-#endif
-            // Handling the last camera images. There's no more rows after the nearest_row, so we set after_nearest_row
-            // to be nearest_row to avoiding sleeping at the end.
-            nearest_row       = std::prev(after_nearest_row, 1);
-            after_nearest_row = nearest_row;
-            // We are running out of the dataset and the loop will stop next time.
-            internal_stop();
-        } else if (after_nearest_row == _m_sensor_data.cbegin()) {
-            // Should not happen because lookup_time is bigger than dataset_first_time
-#ifndef NDEBUG
-            spdlog::get(name)->warn("Time {} ({} + {}) before first datum {}", lookup_time,
-                                    _m_rtc->now().time_since_epoch().count(), dataset_first_time,
-                                    _m_sensor_data.cbegin()->first);
-#endif
-        } else {
-            // Most recent
-            nearest_row = std::prev(after_nearest_row, 1);
+        // Wrap raw PNG bytes in a cv::Mat (no copy), then decode
+        cv::Mat png0_buf(1, (int)frame.cam0_size, CV_8UC1,
+                         const_cast<uint8_t*>(frame.cam0_png));
+        cv::Mat png1_buf(1, (int)frame.cam1_size, CV_8UC1,
+                         const_cast<uint8_t*>(frame.cam1_png));
+
+        cv::Mat img0 = cv::imdecode(png0_buf, cv::IMREAD_GRAYSCALE);
+        cv::Mat img1 = cv::imdecode(png1_buf, cv::IMREAD_GRAYSCALE);
+
+        if (img0.empty() || img1.empty()) {
+            printf("[offline_cam] ERROR: imdecode failed frame %zu\n", current_idx_);
+            k_sem_give(&stoplight_cam);
+            ++current_idx_;
+            return;
         }
 
-        if (last_ts != nearest_row->first) {
-            last_ts = nearest_row->first;
+        CamMsg* msg = new CamMsg{
+            ILLIXR::time_point{std::chrono::nanoseconds{frame.ts_ns}},
+            img0,
+            img1
+        };
 
-            auto img0 = nearest_row->second.cam0.load();
-            auto img1 = nearest_row->second.cam1.load();
-
-            time_point expected_real_time_given_dataset_time(
-                std::chrono::duration<long, std::nano>{nearest_row->first - dataset_first_time});
-            _m_cam_publisher.put(_m_cam_publisher.allocate<cam_type>(cam_type{
-                expected_real_time_given_dataset_time,
-                img0,
-                img1,
-            }));
+        int rc = k_msgq_put(&openvins_cam_queue, &msg, K_NO_WAIT);
+        
+        if (rc != 0) {
+            delete msg;
+            printf("[offline_cam] ERROR: queue put failed rc=%d\n", rc);
         }
-        std::this_thread::sleep_for(std::chrono::nanoseconds(after_nearest_row->first - dataset_first_time -
-                                                             _m_rtc->now().time_since_epoch().count() - 2));
+
+        printf("[offline_cam] SENT frame #%03zu  ts=%lld ns  img=%dx%d\n",
+               current_idx_, (long long)frame.ts_ns,
+               img0.cols, img0.rows);
+
+        ++current_idx_;
     }
 
 private:
-    const std::shared_ptr<switchboard>             sb;
-    switchboard::writer<cam_type>                  _m_cam_publisher;
-    const std::map<ullong, sensor_types>           _m_sensor_data;
-    ullong                                         dataset_first_time;
-    ullong                                         last_ts;
-    std::shared_ptr<RelativeClock>                 _m_rtc;
-    std::map<ullong, sensor_types>::const_iterator next_row;
+    size_t current_idx_;
 };
 
-PLUGIN_MAIN(offline_cam)
+void start_offline_cam(phonebook_new& pb) {
+    static Offline_cam instance{pb};
+    instance.start();
+}
+
+REGISTER_PLUGIN(offline_cam);
