@@ -1,137 +1,100 @@
 #include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
-#include <map>
 #include <cstdint>
 #include <chrono>
+#include <cmath>
 
-// Core ILLIXR includes
-#include "../../src/plugin.hpp"
-#include "../../src/node.hpp"
+#include "../../src/threadloop.hpp"
 #include "../../src/phonebook_new.hpp"
 #include "../../src/plugin_registry.hpp"
 #include "../../src/data_format.hpp"
-#include "../../src/relative_clock.hpp"
+#include "../../src/stoplight.hpp"
+#include "../openvins/openvins_queues.hpp"
+#include "../imu_integrator/imu_integrator_queue.hpp"
 
-#include "data_loading.hpp"
+#include "embedded_imu.hpp"
 
 using namespace ILLIXR;
 
-// ==============================================================================
-// THREAD STACK DEFINITION
-// ==============================================================================
-#define IMU_STACK_SIZE 4096
-#define IMU_PRIORITY   5
+extern uint64_t g_program_start_mtime;
 
-static K_THREAD_STACK_DEFINE(imu_stack_area, IMU_STACK_SIZE);
+// CLINT mtime: global real-time counter, consistent across all harts
+static inline uint64_t read_mtime() {
+    volatile uint64_t* mtime = reinterpret_cast<volatile uint64_t*>(0x200bff8UL);
+    return *mtime;
+}
 
-// ==============================================================================
-// PLUGIN CLASS
-// ==============================================================================
-class Offline_imu : public Plugin {
+K_THREAD_STACK_DEFINE(offline_imu_stack, 262144);
+
+// Window size must match what openvins expects
+static constexpr size_t kSamplesPerWindow = 10;
+
+class Offline_imu : public threadloop {
 public:
     explicit Offline_imu(phonebook_new& pb)
-        : Plugin{pb, "offline_imu"}
-        , clock_{get_global_relative_clock()}
-        , _m_sensor_data{load_data()}
-        , _m_sensor_data_it{_m_sensor_data.cbegin()}
-        , dataset_first_time{
-              _m_sensor_data_it != _m_sensor_data.end()
-                  ? _m_sensor_data_it->first
-                  : 0
-          }
+        : threadloop{pb, "offline_imu",
+                     offline_imu_stack,
+                     K_THREAD_STACK_SIZEOF(offline_imu_stack),
+                     5}
+        , current_idx_{0}
     {
-        printk("[offline_imu] Constructor. Data size: %zu\n", _m_sensor_data.size());
-
-        node().publish_to_periodic<int>(
-            "p3",
-            1000,
-            []() -> int {
-                static int value = 0;
-                return value++;
-            }
-        );
+        printf("[offline_imu] constructed  samples=%zu (EuRoC embedded)\n",
+               kEmbeddedImuCount);
     }
 
-    virtual void start() override {
-        if (_m_sensor_data.empty()) {
-            printk("[offline_imu] No IMU data loaded. Thread skipped.\n");
-            return;
+    skip_option _p_should_skip() override {
+        if (current_idx_ >= kEmbeddedImuCount)
+            return skip_option::stop;
+        return skip_option::run;
+    }
+
+    void _p_one_iteration() override {
+        size_t pos_in_window = current_idx_ % kSamplesPerWindow;
+
+        if (pos_in_window == 0) {
+            k_sem_take(&stoplight_imu, K_FOREVER);
+            printf("[Offline_imu] Green light received, sending window starting at #%zu\n",
+                   current_idx_);
         }
 
-        printk("[offline_imu] Spawning playback thread...\n");
+        const auto& s = kEmbeddedImu[current_idx_];
 
-        k_thread_create(
-            &thread_data_,
-            imu_stack_area,
-            K_THREAD_STACK_SIZEOF(imu_stack_area),
-            thread_entry_point,
-            this, NULL, NULL,
-            K_PRIO_PREEMPT(IMU_PRIORITY),
-            0,
-            K_NO_WAIT
-        );
+        ImuMsg* msg_vins = new ImuMsg{
+            time_point{std::chrono::nanoseconds{s.ts_ns}},
+            Eigen::Vector3d{s.wx, s.wy, s.wz},
+            Eigen::Vector3d{s.ax, s.ay, s.az}
+        };
+        ImuMsg* msg_int = new ImuMsg{*msg_vins};  // copy
+
+        int rc1 = k_msgq_put(&openvins_imu_queue,     &msg_vins, K_NO_WAIT);
+        int rc2 = k_msgq_put(&imu_integrator_queue,   &msg_int,  K_NO_WAIT);
+
+        if (rc1 != 0) { delete msg_vins; printf("[offline_imu] ERROR: openvins queue full\n"); }
+        if (rc2 != 0) { delete msg_int;  printf("[offline_imu] ERROR: integrator queue full\n"); }
+        printf("[offline_imu] IMU #%04zu ts=%lld ns\n",
+               current_idx_ + 1, (long long)s.ts_ns);
+
+        ++current_idx_;
+
+        if (current_idx_ == 50) {
+            uint64_t end_mtime  = read_mtime();
+            uint64_t elapsed    = end_mtime - g_program_start_mtime;
+            // CLINT mtime ticks at the CPU reference clock (10 MHz on Spike by default)
+            // elapsed / 10_000_000 = wall seconds
+            double   elapsed_s  = static_cast<double>(elapsed) / 10000000.0;
+            double   imu_span_s = static_cast<double>(s.ts_ns - kEmbeddedImu[0].ts_ns) * 1e-9;
+            printf("\n[MTIME_COUNT] 50 IMU samples processed (global CLINT mtime)\n");
+            printf("[MTIME_COUNT]   start  mtime  : %llu ticks\n", (unsigned long long)g_program_start_mtime);
+            printf("[MTIME_COUNT]   end    mtime  : %llu ticks\n", (unsigned long long)end_mtime);
+            printf("[MTIME_COUNT]   elapsed ticks : %llu\n",       (unsigned long long)elapsed);
+            printf("[MTIME_COUNT]   elapsed time  : %.6f s  (at 10 MHz mtime clock)\n", elapsed_s);
+            printf("[MTIME_COUNT]   IMU data span : %.6f s\n", imu_span_s);
+            printf("[MTIME_COUNT]   slowdown ratio: %.2fx real-time\n\n", elapsed_s / imu_span_s);
+        }
+        k_yield();
     }
 
 private:
-    RelativeClock&                                 clock_;
-    const std::map<ullong, sensor_types>           _m_sensor_data;
-    std::map<ullong, sensor_types>::const_iterator _m_sensor_data_it;
-    ullong                                         dataset_first_time;
-
-    struct k_thread thread_data_;
-
-    static void thread_entry_point(void* p1, void*, void*) {
-        Offline_imu* self = static_cast<Offline_imu*>(p1);
-        self->run_data_playback_loop();
-    }
-
-    void run_data_playback_loop() {
-        printk("[offline_imu] Thread running (ID: %p). Starting clock.\n", k_current_get());
-        clock_.start(); 
-
-        while (!should_stop_) {
-            node_.service_periodic();
-
-            if (_m_sensor_data_it != _m_sensor_data.end()) {
-                ullong dataset_now = _m_sensor_data_it->first;
-                auto dataset_elapsed = std::chrono::nanoseconds{dataset_now - dataset_first_time};
-                auto rtc_elapsed     = clock_.now().time_since_epoch();
-
-                if (rtc_elapsed >= dataset_elapsed) {
-                    const sensor_types& sensor_datum = _m_sensor_data_it->second;
-
-                    ImuMsg imu_msg{
-                        time_point{dataset_elapsed},
-                        sensor_datum.imu0.angular_v,
-                        sensor_datum.imu0.linear_a
-                    };
-
-                    node().publish_to<ImuMsg>("p3", imu_msg);
-
-                    // DEBUG: Print EVERY message to confirm flow
-                    static int count = 0;
-                    if (++count % 1 == 0) {
-                    
-                         printk("[offline_imu] Push T=%lld\n", (long long)dataset_elapsed.count());
-                         // Thread information
-                         printk("[offline_imu]   Thread ID: %p\n", k_current_get());
-                    
-                    }
-                    ++_m_sensor_data_it;
-                } 
-            } else {
-                static bool printed_end = false;
-                if (!printed_end) {
-                    printk("[offline_imu] End of dataset reached.\n");
-                    printed_end = true;
-                }
-                k_msleep(10);
-                continue;
-            }
-
-            k_usleep(100);
-        }
-    }
+    size_t current_idx_;
 };
 
 void start_offline_imu(phonebook_new& pb) {
